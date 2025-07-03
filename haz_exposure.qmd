@@ -1,0 +1,1996 @@
+---
+format:
+  html:
+    theme: flatly
+    code-fold: true
+    code-tools: true
+    code-summary: "Show code"
+runtime: shiny
+---
+
+```{=html}
+<style>
+.main-container {
+  max-width: 1800px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+```
+
+```{r}
+#| label: setup
+#| include: false
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 999)
+options(rsconnect.http.timeout = 60)
+```
+
+```{r}
+#| label: load-packages-create-functions
+#| echo: false
+#| warning: false
+#| message: false
+pacman::p_load(terra,duckdb,geoarrow,arrow,sf,ggupset,ggplot2,colorspace,patchwork,scales,plotly,data.table,shiny,DT,glue,memoise)
+options(scipen = 999)
+
+ci_95 <- function(mean, sd, n) {
+  error <- qt(0.975, df = n - 1) * sd / sqrt(n)
+  lower <- mean - error
+  upper <- mean + error
+  return(data.table(lower = lower, upper = upper))
+}
+```
+
+```{r}
+#| label: set-up-choices
+#| echo: false
+#| message: false
+
+# mapping of spam codes to full crop names
+ms_codes_url<-"https://raw.githubusercontent.com/AdaptationAtlas/hazards_prototype/main/metadata/SpamCodes.csv"
+ms_codes<-data.table::fread(ms_codes_url)[compound=="no"][,Code:=tolower(Code)][,Fullname:=gsub(" ","-",Fullname)][!is.na(Code)]
+
+# Set commodity groups
+crops<-ms_codes$Fullname
+cereals<-ms_codes[cereal==T,Fullname]
+legumes<-ms_codes[legume==T,Fullname]
+root_tubers<-ms_codes[root_tuber==T,Fullname]
+livestock<-c("cattle-highland","cattle-tropical","goats-highland","goats-tropical","pigs-highland","pigs-tropical", 
+             "poultry-highland","poultry-tropical","sheep-highland","sheep-tropical")
+all_commodities<-c(crops,livestock)
+all_options<-c("all","crops","livestock","cereals","legumes","roots_tubers",all_commodities)
+
+timeframes<-c("2021-2040","2041-2060","2061-2080","2081-2100")
+scenarios<-c("ssp126","ssp245","ssp370","ssp585")
+
+scen_x_time<-data.table(expand.grid(scenarios=scenarios,timeframes=timeframes))
+scen_x_time<-sort(scen_x_time[,paste0(scenarios,"_",timeframes)])
+scen_x_time<-c("historic",scen_x_time)
+
+models<-c("historic","ENSEMBLE")
+severities<-c("moderate","extreme","severe")
+variables<-c("vop_intld15","vop_usd15")
+periods<-c("annual","jagermeyr")
+interactions<-list(generic=c("NDWS+NTx35+NDWL0","NDWS+THI-max+NDWL0"),
+                   crop_specific=c("PTOT-L+NTxS+PTOT-G","PTOT-L+THI-max+PTOT-G"))
+```
+
+```{r}
+#| label: Duckdb-connection-to-admin-vector-geoparquet-table
+#| echo: false
+#| message: false
+
+# Admin vector file
+admin_2_file<-"s3://digital-atlas/domain=boundaries/type=admin/source=gaul2024/region=africa/processing=simplified/level=adm2/atlas_gaul24_a2_africa_simple-lowres.parquet"
+admin_name_file_local<-basename(admin_2_file)
+
+if(!file.exists(admin_name_file_local)){
+  x<-read_parquet(admin_2_file)
+  
+  # Connect and load extensions
+  con <- dbConnect(duckdb())
+
+ sql_select_cols <- paste(c("admin0_name","admin1_name","admin2_name"), collapse = ", ")  
+  
+  # Get admin2 names from s3
+  query <- paste0("
+    SELECT ", sql_select_cols, "
+    FROM '", admin_2_file, "'
+  ")
+  admin_names <- data.table(dbGetQuery(con, query))
+  
+  dbDisconnect(con, shutdown = TRUE)
+  
+  write_parquet(admin_names,admin_name_file_local)
+}else{
+  admin_names<-read_parquet(admin_name_file_local)
+  }
+
+admin0_names<-sort(admin_names[,unique(admin0_name)])
+```
+
+
+## Climate Hazard Exposure {.tabset .tabset-fade .tabset-pills}
+
+**Data controls**
+
+`Dev Note`: Interaction set `vop_intdl15` and calculation window `jagermeyr` not in s3 yet.
+`Dev Note`: Load times are currently high, how we can make the note book more performant? Q5 is the main culprit as it requires downloading the data for all scenarios x timeframes (4 x 4 = 16x more data).    
+`Dev Note`: Consider caching data?
+`Dev Note`: Better to start with map?
+
+:::: {style="display: flex;"}
+::: {}
+```{r}
+#| label: select-severity
+#| echo: false
+Section1.Input.Width<-"240px"
+Section1.Input.Width_half<-"120px"
+
+  selectInput(
+    inputId="severity", 
+    label="Hazard severity", 
+    choices = severities, 
+    selected = "severe", 
+    multiple = F,
+    width=Section1.Input.Width)
+```
+:::
+:::{}
+```{r}
+#| label: select exposure variable
+#| echo: false
+  selectInput(
+    inputId="variable", 
+    label="Exposure variable", 
+    choices = variables, 
+    selected = "vop_usd15", 
+    multiple = F,
+    width=Section1.Input.Width)
+```
+:::
+:::{}
+```{r}
+#| label:  select-calculation-window
+#| echo: false
+  selectInput(
+    inputId="period", 
+    label="Calculation window", 
+    choices = periods, 
+    selected = "annual", 
+    multiple = F,
+    width=Section1.Input.Width)
+```
+:::
+:::{}
+```{r}
+#| label: select interaction type
+#| echo: false
+  selectInput(
+    inputId="interaction", 
+    label="Hazard method", 
+    choices = names(interactions), 
+    selected = "generic", 
+    multiple = F,
+    width=Section1.Input.Width)
+```
+:::
+::::
+
+**Geographic selectors**
+
+:::: {style="display: flex;"}
+::: {}
+```{r}
+#| label:  select-scenario-1
+#| echo: false
+  selectInput(
+    inputId="scenario1", 
+    label="Scenario 1 (left)", 
+    choices = scen_x_time, 
+    selected = "historic", 
+    multiple = F,
+    width=Section1.Input.Width)
+```
+:::
+:::{}
+```{r}
+#| label:  select-scenario-2
+#| echo: false
+
+  selectInput(
+    inputId="scenario2", 
+    label="Scenario 2 (right)", 
+    choices = scen_x_time, 
+    selected = "ssp585_2041-2060", 
+    multiple = F,
+    width=Section1.Input.Width)
+```
+:::
+:::{}
+``` {r}
+#| label:  select-admin0
+#| echo: false
+  selectInput(
+    inputId="admin0", 
+    label="Country", 
+    choices = admin0_names, 
+    selected = "Kenya", 
+    multiple = T,
+    width=Section1.Input.Width)
+```
+:::
+:::{}
+``` {r}
+#| label: select-admin1
+#| echo: false
+
+admin1_choices<-reactive({admin_names[admin0_name==input$admin0,unique(admin1_name)]})
+
+renderUI({
+    tagList(
+  selectInput(
+    inputId="admin1", 
+    label="Admin 1 (subnational)", 
+    choices = admin1_choices(), 
+    selected = NULL, 
+    multiple = T,
+    width=Section1.Input.Width),
+    actionButton("admin1", "Clear selection", class = "btn-sm btn-outline-danger")
+    )
+ })
+
+admin1<-reactive({if(input$admin1==0){NULL}else{input$admin1}})
+```
+:::
+:::{}
+``` {r}
+#| label:  select-admin2
+#| echo: false
+
+admin2_choices<-reactive({
+  if(!is.null(admin1())){
+    admin_names[admin0_name %in% input$admin0 & admin1_name %in% admin1(),unique(admin2_name)]
+  }else{
+    admin_names[admin0_name %in% input$admin0,unique(admin2_name)]
+  }
+  })
+
+renderUI({
+      tagList(
+  selectInput(
+    inputId="admin2", 
+    label="Admin 2 (subnational)", 
+    choices = admin2_choices(), 
+    selected = NULL, 
+    multiple = T,
+    width=Section1.Input.Width),
+    actionButton("admin2", "Clear selection", class = "btn-sm btn-outline-danger")
+    )
+ })
+
+admin2<-reactive({if(input$admin2==0){NULL}else{input$admin2}})
+```
+:::
+::::
+
+```{r}
+#| label:  select-commodities
+#| echo: false
+renderUI({
+  tagList(
+    checkboxGroupInput(
+      inputId = "commods",
+      label = "Commodities",
+      choices = all_options,
+      selected = "crops",
+      inline = TRUE
+    ),
+    actionButton("clear_commods", "Clear selection", class = "btn-sm btn-outline-danger")
+  )
+})
+
+commodities<-reactive({
+  commodities<-input$commods
+  if("crops" %in% commodities){
+    commodities<-unique(c(commodities,crops))
+    commodities<-commodities[commodities!="crops"]
+  }
+  
+  if("cereals" %in% commodities){
+      commodities<-unique(c(commodities,cereals))
+      commodities<-commodities[commodities!="cereals"]
+  }
+  
+  if("legumes" %in% commodities){
+      commodities<-unique(c(commodities,legumes))
+      commodities<-commodities[commodities!="legumes"]
+  }
+  
+  if("roots_tubers" %in% commodities){
+      commodities<-unique(c(commodities,roots_tubers))
+      commodities<-commodities[commodities!="roots_tubers"]
+  }
+  
+  if("livestock" %in% commodities){
+      commodities<-unique(c(commodities,livestock))
+      commodities<-commodities[commodities!="livestock"]
+    }
+  
+  if("all" %in% commodities){
+      commodities<-unique(c(commodities,all_commodities))
+      commodities<-commodities[commodities!="all_commodities"]
+  }
+  commodities
+})
+```
+
+```{r}
+#| label: create-additional-selections
+#| echo: false
+
+comparison_scen1<-reactive({
+  if(input$scenario1=="historic"){
+   list(scenario="historic",timeframe="historic") 
+  }else{
+    list(scenario=tstrsplit(input$scenario1,"_",keep=1),
+                     timeframe=tstrsplit(input$scenario1,"_",keep=2))
+  }
+})
+  
+comparison_scen2<-reactive({
+   if(input$scenario2=="historic"){
+    list(scenario="historic",timeframe="historic") 
+  }else{
+    list(scenario=tstrsplit(input$scenario2,"_",keep=1),
+      timeframe=tstrsplit(input$scenario2,"_",keep=2))
+  }
+})
+
+exposure<-reactive({unlist(tstrsplit(input$variable,"_",keep=1))})
+unit<-reactive({unlist(tstrsplit(input$variable,"_",keep=2))})
+```
+
+### Download & Prepare Data (technical users)  {.tabset .tabset-fade .tabset-pills}
+
+#### Download
+
+`Dev Note: Consider using memoise to cache downloaded data`
+
+**Download total exposure**  
+Total exposure data will be merged with the hazard exposure data so that we can calculate relative exposure.
+
+Create helper function to download total exposure data:
+```{r}
+#| label: create-total-exp-dl-helper
+#| echo: true
+#| code-fold: true
+
+dl_tot_exposure<-function(admin0,admin1,admin2,exp_file,tech="all",unit){
+  # Construct SQL filters
+  # No crop filter (download all for the selected geographies so changes in user crop selections do not trigger new downloads)
+  sql_admin0 <- paste(sprintf("'%s'", admin0), collapse = ", ")
+  select_cols<-c("admin0_name","admin1_name","admin2_name","crop","value")
+  sql_select_cols <- paste(select_cols, collapse = ", ")  
+  
+  # NULL admin1/admin2 means `IS NULL` in SQL
+  sql_admin1 <- if (is.null(admin1)) {
+    "admin1_name IS NULL"
+  } else {
+    sprintf("admin1_name IN (%s)", paste(sprintf("'%s'", admin1), collapse = ", "))
+  }
+  
+  sql_admin2 <- if (is.null(admin2)) {
+    "admin2_name IS NULL"
+  } else {
+    sprintf("admin2_name IN (%s)", paste(sprintf("'%s'", admin2), collapse = ", "))
+  }
+  
+  con <- DBI::dbConnect(duckdb::duckdb(), config = list("parquet_enable_dictionary" = FALSE))
+  ## one-time install (downloads the extension into ~/.local/share/R/duckdb/extensions)
+  dbExecute(con, "INSTALL httpfs")      # need internet access
+  dbExecute(con, "LOAD httpfs")         # activate it for this session
+  
+  query <- glue("
+    SELECT {sql_select_cols}
+    FROM read_parquet('{exp_file}')
+    WHERE admin0_name IN ({sql_admin0})
+      AND {sql_admin1 |> 
+           sub('admin1_name IS NULL', \"COALESCE(admin1_name,'') = ''\", x = _)}
+      AND {sql_admin2 |>
+           sub('admin2_name IS NULL', \"COALESCE(admin2_name,'') = ''\", x = _)}
+      AND unit = '{unit}'
+      AND (tech = 'all' OR tech IS NULL)
+  ")
+  
+  exp_tot <- data.table(DBI::dbGetQuery(con, query))
+  dbDisconnect(con, shutdown = TRUE)
+  
+  # Sum across non-value cols 
+  agg_cols<-select_cols[select_cols!="value"]
+  exp_tot<-exp_tot[,.(value=sum(value,na.rm=T)),by=agg_cols]
+  setnames(exp_tot,"value","value_tot")
+  
+  return(exp_tot)
+}
+```
+
+```{r}
+#| label: download-total-exposure-inputs
+#| echo: true
+#| code-fold: true
+
+renderPrint({
+  list(admin0=input$admin0,
+       admin1=admin1(),
+       admin2=admin2(),
+       exp_file=exp_file,
+       tech="all",
+       unit = unit()
+  )
+})
+```
+
+Download total exposure:
+```{r}
+#| label: download-total-exposure
+#| echo: true
+
+# This will be merged with the hazard exposure data so that we can calculate relative exposure
+exp_file<-"s3://digital-atlas/domain=exposure/type=combined/source=glw4+spam2020v1r2_ssa/region=ssa/processing=aggregated/gaul24_adm0-1-2_exposure.parquet"
+
+exp_tot<-reactive({
+  dl_tot_exposure(admin0=input$admin0,
+                admin1=admin1(),
+                admin2=admin2(),
+                exp_file=exp_file,
+                tech="all",
+                unit = unit()
+                )
+})
+```
+
+Total exposure data:
+```{r}
+#| label: render-exp-tot-tab
+#| echo: false
+
+ DT::renderDataTable({
+  DT::datatable(
+    exp_tot(),
+    rownames = FALSE,
+    options = list(
+      pageLength = 10,
+      autoWidth = TRUE,
+      dom = 'Bfrtip',  # adds buttons
+      buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+    ),
+    extensions = c('Buttons')
+  )
+ })
+```
+
+**Download hazard exposure**
+
+Create helper function to connect to an in-memory DuckDB instance:
+```{r}
+#| label: create-haz-exp-dl-helper
+#| echo: true
+
+haz_s3q<-function(path,crops,admin0,admin1,admin2,timeframe,scenario,hazard_vars,select_cols){
+  con <- dbConnect(duckdb::duckdb())
+   on.exit(dbDisconnect(con, shutdown = TRUE))
+
+  if(timeframe[1]=="historic"){
+    select_cols<-select_cols[select_cols!="value_sd"]
+  }
+  
+  # Construct SQL filters
+  sql_crop <- paste(sprintf("'%s'", crops), collapse = ", ")
+  sql_admin0 <- paste(sprintf("'%s'", admin0), collapse = ", ")
+  sql_timeframe <- paste(sprintf("'%s'", timeframe), collapse = ", ")
+  sql_scenario <- paste(sprintf("'%s'", scenario), collapse = ", ")
+  sql_select_cols <- paste(select_cols, collapse = ", ")  
+  sql_hazard_vars <- paste(sprintf("'%s'", hazard_vars), collapse = ", ")  
+  
+  # NULL admin1/admin2 means `IS NULL` in SQL
+  sql_admin1 <- if (is.null(admin1)) {
+    "admin1_name IS NULL"
+  } else {
+    sprintf("admin1_name IN (%s)", paste(sprintf("'%s'", admin1), collapse = ", "))
+  }
+  
+  sql_admin2 <- if (is.null(admin2)) {
+    "admin2_name IS NULL"
+  } else {
+    sprintf("admin2_name IN (%s)", paste(sprintf("'%s'", admin2), collapse = ", "))
+  }
+
+  
+  # Build the query
+  query <- sprintf("
+    SELECT %s
+    FROM read_parquet('%s')
+    WHERE crop IN (%s)
+      AND admin0_name IN (%s)
+      AND %s
+      AND %s
+      AND timeframe IN (%s)
+      AND scenario IN (%s)
+      AND hazard_vars IN (%s)
+  ", 
+                   sql_select_cols,
+                   path,
+                   sql_crop,
+                   sql_admin0,
+                   sql_admin1,
+                   sql_admin2,
+                   sql_timeframe,
+                   sql_scenario,
+                   sql_hazard_vars
+  )
+  
+  # Execute the query
+  result <- data.table(dbGetQuery(con, query))
+  
+  # In contested areas sometimes mean admin0/admin1 units are split, sum results over split areas to merge them with parent country
+  agg_cols <- setdiff(select_cols, c("value", "value_sd"))
+
+    if(timeframe[1]=="historic"){
+   result<-result[,.(value=sum(value,na.rm=T)),by=agg_cols]
+   result[,value_sd:=NA_real_]
+  }else{
+   result<-result[,.(value=sum(value,na.rm=T),value_sd=sum(value_sd,na.rm=T)),by=agg_cols]
+  }
+  
+  do.call(setorder, c(list(result), select_cols))
+  
+  return(result)
+}
+```
+
+Create paths for s3 hazard exposure files:
+```{r}
+#| label: create-s3-paths
+#| echo: true
+
+s3_parquet_paths<-data.table(expand.grid(model=models,
+                                         severity=severities,
+                                         variable=variables,
+                                         period=periods))
+
+s3_parquet_paths[,filepath:=paste0("s3://digital-atlas/domain=hazard_exposure/source=atlas_cmip6/region=ssa/processing=hazard-risk-exposure/variable=",                                 variable,
+                               "/period=",period,
+                               "/model=",model,
+                               "/severity=",severity,
+                               "/interaction.parquet")]
+
+# Select paths re-actively
+haz_exp_hist_path<-reactive({
+  s3_parquet_paths[severity == input$severity & 
+                                 period == input$period &
+                                 variable == input$variable &
+                                 model == "historic",filepath]
+})
+
+haz_exp_ens_path<-reactive({
+  s3_parquet_paths[severity == input$severity & 
+                                period == input$period &
+                                variable==input$variable &
+                                model == "ENSEMBLE",filepath]
+})
+
+```
+
+Download scenario1
+```{r download hazard exposure S1}
+#| label: download-hazard-exp-s1
+#| echo: true
+
+select_cols <- c("severity","scenario","timeframe","admin0_name", "admin1_name", "admin2_name", "crop", "hazard","value", "value_sd")
+
+haz_s1_all<-reactive({
+  haz_s3q(path = if(comparison_scen1()$scenario=="historic"){haz_exp_hist_path()}else{haz_exp_ens_path()},
+                      crops = all_commodities,
+                      admin0 = input$admin0,
+                      admin1 = admin1(),
+                      admin2 = admin2(),
+                      timeframe = if(comparison_scen1()$scenario=="historic"){"historic"}else{timeframes},
+                      scenario =  if(comparison_scen1()$scenario=="historic"){"historic"}else{scenarios},
+                      hazard_vars = interactions[[input$interaction]],
+                      select_cols = select_cols)
+})
+```
+
+Scenario 1 table
+```{r render hazard exp tab1}
+#| echo: false
+
+ DT::renderDataTable({
+  DT::datatable(
+    haz_s1_all(),
+    rownames = FALSE,
+    options = list(
+      pageLength = 10,
+      autoWidth = TRUE,
+      dom = 'Bfrtip',  # adds buttons
+      buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+    ),
+    extensions = c('Buttons')
+  )
+ })
+```
+
+Download scenario2
+```{r download hazard exposure S2}
+#| label: download-hazard-exp-s2
+#| echo: true
+#| 
+haz_s2_all<-reactive({
+  haz_s3q(path = if(comparison_scen2()$scenario=="historic"){haz_exp_hist_path()}else{haz_exp_ens_path()},
+                    crops = all_commodities,
+                    admin0 = input$admin0,
+                    admin1 = admin1(),
+                    admin2 = admin2(),
+                timeframe = if(comparison_scen2()$scenario=="historic"){"historic"}else{timeframes},
+                scenario =  if(comparison_scen2()$scenario=="historic"){"historic"}else{scenarios},
+                    hazard_vars = interactions[[input$interaction]],
+                    select_cols = select_cols)
+})
+```
+
+Scenario 2 table
+```{r render hazard exp tab2}
+#| echo: false
+
+ DT::renderDataTable({
+  DT::datatable(
+    haz_s2_all(),
+    rownames = FALSE,
+    options = list(
+      pageLength = 10,
+      autoWidth = TRUE,
+      dom = 'Bfrtip',  # adds buttons
+      buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+    ),
+    extensions = c('Buttons')
+  )
+ })
+```
+
+#### Prepare
+
+Create function to process downloaded data for plotting.
+```{r haz ex prep helper function}
+#| echo: true
+
+  prep_haz_ex<-function(haz_s1_all,haz_s2_all,exp_tot,comparison_scen1,comparison_scen2,commodities){
+    # Subset to selected scenario and timeframe ####
+    haz_s1<-haz_s1_all[scenario == comparison_scen1$scenario & 
+                         timeframe == comparison_scen1$timeframe &
+                         crop %in% commodities
+                       ]
+    
+    haz_s2<-haz_s2_all[scenario == comparison_scen2$scenario & 
+                         timeframe == comparison_scen2$timeframe & 
+                         crop %in% commodities]
+    
+    if(nrow(haz_s1)!=nrow(haz_s2)){
+      warning("Number of rows in scenario 1",nrow(haz_s1),"does not match scenario 2",nrow(haz_s2))
+    }
+    # Rename fields ####
+    setnames(haz_s1,c("value","value_sd"),c("value1","value_sd1"),skip_absent=T)
+    setnames(haz_s2,c("value","value_sd"),c("value2","value_sd2"),skip_absent=T)
+    haz_s1[,scenario1:=paste(unique(c(scenario,timeframe)),collapse="-")][,c("scenario","timeframe"):=NULL]
+    haz_s2[,scenario2:=paste(unique(c(scenario,timeframe)),collapse="-")][,c("scenario","timeframe"):=NULL]
+  
+    # Merge scenarios into a single table ####
+    haz_merge<-cbind(haz_s1,haz_s2[,.(scenario2,value2,value_sd2)])
+    
+    # Add 1 only, 2 only, 3 only hazard categories ####
+    agg_cols <- c("severity","scenario1","scenario2","admin0_name", "admin1_name", "admin2_name", "crop", "hazard")
+    
+    num_cols <- names(haz_merge)[
+      sapply(haz_merge, is.numeric) & !names(haz_merge) %in% agg_cols
+    ]
+    
+    haz1<-haz_merge[!is.na(hazard) & !grepl("\\+", hazard) & hazard!="any"]
+    haz1[,hazard:="1 hazard"]
+    haz2<-haz_merge[!is.na(hazard) & lengths(regmatches(hazard, gregexpr("\\+", hazard))) == 1]
+    haz2[,hazard:="2 hazards"]
+    haz3<-haz_merge[!is.na(hazard) & lengths(regmatches(hazard, gregexpr("\\+", hazard))) >= 2]
+    haz3[,hazard:="3 hazards"]
+    
+    haz123<-rbind(haz1,haz2,haz3)
+    
+    # Sum values for the new categories ####
+    haz123 <- haz123[, lapply(.SD, sum, na.rm = TRUE), by = agg_cols, .SDcols = num_cols]
+    
+    # Bind to the main dataset
+    haz_merge<-rbind(haz_merge,haz123)
+    
+    # Add any heat, any wet, and any dry hazards ####
+    heat<-haz_merge[grep("heat",hazard)]
+    heat[,hazard:="heat (any)"]
+    
+    wet<-haz_merge[grep("wet",hazard)]
+    wet[,hazard:="wet (any)"]
+    
+    dry<-haz_merge[grep("dry",hazard)]
+    dry[,hazard:="dry (any)"]
+    
+    # combine
+    dhw<-rbind(dry,heat,wet)
+    
+    # Sum values for the new categories
+    dhw <- dhw[, lapply(.SD, sum, na.rm = TRUE), by = agg_cols, .SDcols = num_cols]
+    
+    # Bind to the main dataset
+    haz_merge<-rbind(haz_merge,dhw)
+    
+    # Merge in total exposure values (i.e. the total value of production or harvested areas) ####
+    haz_merge<-merge(haz_merge,exp_tot,by=c("admin0_name","admin1_name","admin2_name","crop"),all.x=T,sort=F)
+    
+    # Calculate no hazard ####
+    no_haz<-haz_merge[hazard=="any"]
+    no_haz[,value1:=value_tot-value1
+           ][,value_sd1:=((value_tot-value1)/value1)*value_sd1
+             ][,value2:=value_tot-value2
+               ][,value_sd2:=((value_tot-value2)/value2)*value_sd2
+                 ][,hazard:="no hazard"]
+  
+    haz_merge<-rbind(haz_merge,no_haz)
+    
+    # Calculate total for groupings of crops and/or geographies ####
+    # Grand total across all geos and crops
+    agg_cols <- c("severity","scenario1","scenario2","admin0_name", "admin1_name", "admin2_name", "crop", "hazard")
+    
+    num_cols <- names(haz_merge)[
+      sapply(haz_merge, is.numeric) & !names(haz_merge) %in% agg_cols
+    ]
+    
+    agg_cols <- c("severity","scenario1","scenario2", "hazard")
+    haz_tot <- haz_merge[, lapply(.SD, sum, na.rm = TRUE), by = agg_cols, .SDcols = num_cols]
+    haz_tot[,c("admin0_name","admin1_name","admin2_name","crop"):="all"]
+    
+    # Grand total across all crops
+    agg_cols <- c("severity","scenario1","scenario2","admin0_name", "admin1_name", "admin2_name", "hazard")
+    haz_tot_geo <- haz_merge[, lapply(.SD, sum, na.rm = TRUE), by = agg_cols, .SDcols = num_cols]
+    haz_tot_geo<-haz_tot_geo[,crop:="all"]
+    
+    # Grand total across all geo
+    agg_cols <- c("severity","scenario1","scenario2","crop","hazard")
+    haz_tot_crop <- haz_merge[, lapply(.SD, sum, na.rm = TRUE), by = agg_cols, .SDcols = num_cols]
+    haz_tot_crop[,c("admin0_name","admin1_name","admin2_name"):="all"]
+    
+    # Bind back grouped data
+    haz_merge<-rbindlist(list(haz_merge,haz_tot,haz_tot_geo,haz_tot_crop),use.names=T)
+    
+    # Calculate differences ####
+    haz_merge[,diff:=value2-value1]
+    
+    # Calculate relative exposure & errors ####
+  
+    # enforce sd being all NA if scenario is historic
+    haz_merge[scenario1=="historic",value_sd1:=NA]
+    haz_merge[scenario2=="historic",value_sd2:=NA]
+    
+      haz_merge[,perc1:=round(100*value1/value_tot,2)
+                ][,perc_sd1:=round(100*value_sd1/value_tot,2)
+                  ][,cv1:=round(100*value_sd1/value1,2)
+                    ][,perc2:=round(100*value2/value_tot,2)
+                      ][,perc_sd2:=round(100*value_sd2/value_tot,2)
+                        ][,cv2:=round(100*value_sd2/value2,2)
+                          ][,perc_diff:=round(100*diff/value_tot,2)]
+    
+    haz_merge[,c("value1_low","value1_high"):=ci_95(value1,value_sd1,5),by=.I]
+    haz_merge[,c("perc1_low","perc1_high"):=round(ci_95(perc1,perc_sd1,5),2),by=.I]
+    haz_merge[,c("value2_low","value2_high"):=ci_95(value2,value_sd2,5),by=.I]
+    haz_merge[,c("perc2_low","perc2_high"):=round(ci_95(perc2,perc_sd2,5),2),by=.I]
+    
+    # Rename hazard labels and create hazard sets ####
+    haz_merge[hazard=="heat",hazard:="heat (only)"]
+    haz_merge[hazard=="wet",hazard:="wet (only)"]
+    haz_merge[hazard=="dry",hazard:="dry (only)"]
+    haz_merge[hazard=="any",hazard:="any hazard"]
+    return(haz_merge)
+  }
+  
+
+```
+
+Process downloaded data
+```{r prepare data}
+#| echo: true
+    haz_merge<-reactive({
+      prep_haz_ex(haz_s1_all=haz_s1_all(),
+                  haz_s2_all=haz_s2_all(),
+                  exp_tot=exp_tot(),
+                  comparison_scen1=comparison_scen1(),
+                  comparison_scen2=comparison_scen2(),
+                  commodities=commodities())
+    })
+```
+
+Processed data:
+```{r render processed data}
+#| echo: false
+
+ DT::renderDataTable({
+  DT::datatable(
+    haz_merge(),
+    rownames = FALSE,
+    options = list(
+      pageLength = 10,
+      autoWidth = TRUE,
+      dom = 'Bfrtip',  # adds buttons
+      buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+    ),
+    extensions = c('Buttons')
+  )
+ })
+```
+
+Define hazard sets later used in plotting selections
+```{r define hazard sets}
+#| echo: true
+
+  compound_set_full<-c("no hazard","dry (only)","heat (only)","wet (only)","dry+heat","dry+wet","heat+wet","dry+heat+wet")
+  compound_set_simple<-c("no hazard","1 hazard","2 hazards","3 hazards")
+  solo_set<-c("no hazard","dry (any)","heat (any)","wet (any)","any")
+```  
+
+Create palettes
+```{r create palette}
+#| echo: true
+
+  # Build a palette
+  mix_hex <- function(col1, col2, p = 0.5) {
+    stopifnot(is.numeric(p), p >= 0, p <= 1)
+    rgb <- grDevices::colorRamp(c(col1, col2), space = "Lab")(p)   # 0–255
+    grDevices::rgb(rgb[1], rgb[2], rgb[3], maxColorValue = 255)    # back to hex
+  }
+  
+  #Pick three base hues for the single hazards
+  palette<-"Set 2"
+  base_hues <- qualitative_hcl(3, palette = palette)   # any palette is fine
+  names(base_hues) <- c("dry", "heat", "wet")
+  
+  # Build a named vector of final fill colours
+  cols_fill <- c(
+    ## 0-hazard (grey)
+    "no hazard"      = "grey85",
+    
+    ## 1-hazard (very light versions of the bases)
+    "dry (only)"     = as.character(lighten(base_hues["dry"],  .5)),
+    "heat (only)"    = as.character(lighten(base_hues["heat"], .5)),
+    "wet (only)"     = as.character(lighten(base_hues["wet"],  .5)),
+    
+    ## 2-hazard (medium lightness – mix two bases, then lighten a bit)
+    "dry+heat"       = lighten(mix_hex(base_hues["dry"],  base_hues["heat"], .50), -0.1),
+    "dry+wet"        = lighten(mix_hex(base_hues["dry"],  base_hues["wet"],  .50), -0.1),
+    "heat+wet"       = lighten(mix_hex(base_hues["heat"], base_hues["wet"],  .50), -0.1),
+    
+    ## 3-hazard (darkest – mix the three bases 1/3-1/3-1/3)
+    "dry+heat+wet"   = lighten(mix_hex(
+      mix_hex(base_hues["dry"], base_hues["heat"], .50),
+      base_hues["wet"], .67),-0.5)
+  )
+  
+  cols_fill_simple <- c(
+    "no hazard"      = "grey85",
+    "1 hazard"     = as.character(lighten(base_hues["dry"],  .7)),
+    "2 hazards"     = as.character(lighten(base_hues["dry"],  .35)),
+    "3 hazards"     = as.character(base_hues["dry"])
+  )
+  
+  cols_fill_solo <- c(
+    "no hazard"      = "grey85",
+    "heat (any)"     = as.character(base_hues["heat"]),
+    "dry (any)"     = as.character(base_hues["dry"]),
+    "wet (any)"     = as.character(base_hues["wet"]),
+    "any"           = lighten(mix_hex(
+      mix_hex(base_hues["dry"], base_hues["heat"], .50),
+      base_hues["wet"], .67),-0.5)
+  )
+```
+
+#### Inputs for plot functions
+```{r plot inputs}  
+#| echo: true
+plot_inputs<-reactive({
+  if(input$relative==F & input$difference==F){
+    plot_inputs<-list(
+      scenario_cols=c(scenario1="value1",scenario2="value2",diff="diff"),
+      val_col1="value1",
+      val_col2="value2",
+      unit_name=unit())
+  }
+  
+  if(input$relative==T & input$difference==F){
+    plot_inputs<-list(
+      scenario_cols=c(scenario1="perc1",scenario2="perc2",diff="perc_diff"),
+      val_col1="perc1",
+      val_col2="perc2" ,
+      unit_name="%"
+    )
+  }
+  
+  if(input$relative==F & input$difference==T){
+    plot_inputs<-list(
+      scenario_cols=c(scenario1="value1",scenario2="value2",diff="diff"),
+      val_col1="diff",
+      unit_name=unit()
+    )
+  }
+  
+  if(input$relative==T & input$difference==T){
+    plot_inputs<-list(
+      scenario_cols=c(scenario1="perc1",scenario2="perc2",diff="perc_diff"),
+      val_col1="perc_diff",
+      unit_name="%"
+    )
+  }
+  
+  if(input$compound==T){
+  if(input$simplify_compound==T){
+    plot_inputs$haz_set = compound_set_simple
+    plot_inputs$haz_pal = cols_fill_simple
+  }else{
+    plot_inputs$haz_set = compound_set_full
+    plot_inputs$haz_pal = cols_fill
+  }
+}else{
+  plot_inputs$haz_set = solo_set
+  plot_inputs$haz_pal = cols_fill_solo
+}
+  
+  plot_inputs$s1_lab<-haz_merge()$scenario1[1]
+  plot_inputs$s2_lab<-haz_merge()$scenario2[1]
+  plot_inputs$diff_lab<-paste0("Δ ",haz_merge()$scenario2[1]," minus ",plot_title=haz_merge()$scenario1[1])
+
+  plot_inputs$q4_yaxis<-if(!is.null(admin2())){
+    "admin2_name"
+    }else{
+      if(!is.null(admin1())){
+        "admin2_name"
+        }else{
+      "admin0_name"
+        }
+      }
+  
+  plot_inputs
+  
+})
+```
+
+Show inputs
+```{r show plot inputs}
+#| echo: false
+renderPrint({
+  plot_inputs()
+  })
+```
+
+#### Plotting Functions
+**Q1** Upset plotting function
+```{r upset plot fun}
+#| echo: true
+
+q1_fun<-function(data,val_col,exp_lab,plot_title,val_alt=NULL){
+  
+  data[, dry  := grepl("\\bdry\\b",  hazard)]
+  data[, heat := grepl("\\bheat\\b", hazard)]
+  data[, wet  := grepl("\\bwet\\b",  hazard)]
+
+  # Convert logicals to hazard list column
+  data[, hazards := apply(.SD, 1, function(row) names(row)[as.logical(row)]), .SDcols = c("dry", "heat", "wet")]
+
+  if(is.null(val_alt)){
+    data[,valx:=data[[val_col]]]
+  }else{
+    data[,valx:=data[[val_alt]]]
+  }
+  
+  setnames(data,val_col,"value")
+  
+  if(data[,max(valx)>10^9]){
+    data[,value:=value/10^9]
+    lab<-paste0("Exposure B ",exp_lab)
+    }else{
+  if(data[,max(valx)>10^6]){
+    data[,value:=value/10^6]
+    lab<-paste0("Exposure M ",exp_lab)
+  }else{
+    if(data[,max(valx)>10^3]){
+      data[,value:=value/10^3]
+      lab<-paste0("Exposure k ",exp_lab)
+    }else{
+      lab<-paste0("Exposure ",exp_lab)
+    }}}
+  
+  # Use ggupset to make upset ploy
+  p_up<-ggplot(data, aes(x = hazards, y = value)) +
+    geom_col(fill = "grey40") +
+    geom_text(aes(label = scales::comma(value)), vjust = -0.3, size = 3) +
+    scale_x_upset(order_by = NULL) +
+    labs(
+      title = plot_title,
+      x = NULL,
+      y = lab
+    ) +
+    theme_minimal()+
+    theme(
+      axis.text.x        = element_blank(),
+      axis.ticks.x       = element_blank(),
+      panel.grid = element_blank(),
+      plot.margin        = margin(t = 0, r = 0, b = 0, l = 0)  
+    )
+  
+  # Make bars for total hazard exposure
+  haz_cols <- c("dry","heat","wet")
+  
+  single_totals <- data.table(
+    set      = haz_cols,
+    exposure = sapply(haz_cols, \(s) data[get(s) == TRUE, sum(value, na.rm = TRUE)])
+  )[order(set)]  
+  
+  # Need to ensure order of bars is the same as the upset plot, it works in this example but needs further testing
+  
+    p_set<-ggplot(single_totals,
+                   aes(x = exposure,
+                       y = factor(set, levels = rev(single_totals$set)))) +
+    geom_col(width = .55, fill = "grey40") +
+    geom_text(aes(label = comma(exposure)),
+              hjust = 1.05, colour = "white", size = 3) +
+    scale_x_reverse(position = "top",expand = expansion(mult = c(0, 0))) +  # ← reverse!
+    coord_cartesian(clip = "off") +
+    theme(
+      axis.text.y        = element_blank(),
+      axis.ticks.y       = element_blank(),
+      axis.title = element_blank(),
+      panel.grid = element_blank(),
+      panel.background = element_blank(),
+      plot.margin = margin(t = 0, r = 0, b = 0, l = 0)  
+    )
+    
+    # Assemble plots using patchwork
+    design <- "
+A
+B
+"  
+    #  upset panel 
+    plot_right <-wrap_plots(
+        A =p_up,   # empty top-left cell
+        B = patchwork::plot_spacer(), 
+        design  = design,
+        heights = c(0.9999, 0.0001)      
+      )
+    
+    # total bars   
+    plot_left <-wrap_plots(
+      A =patchwork::plot_spacer(),  
+      B = p_set, 
+      design  = design,
+      heights = c(0.93, 0.07)      
+    )
+
+    # merged plot
+    final_plot <-
+      (plot_left | plot_right) +         
+      plot_layout(widths = c(3, 7))  
+    
+    return(final_plot)
+}
+```
+
+**Q2 & Q4** plotting function
+```{r q2 q4 plot fun}
+#| echo: true
+
+q2_fun<-function(plot_dat,
+                   exp_lab,
+                   n_y.groups=NULL,
+                   y_axis = "crop",
+                   val_col,
+                   haz_levels,
+                   cols_fill,
+                   plot_title,
+                   is_compound=T,
+                   plotly=T){
+
+  plot_dat[,value:=plot_dat[[val_col]]]
+  plot_dat[,y_axis:=plot_dat[[y_axis]]]
+
+  if(grepl("diff",val_col)){
+    y_order <- plot_dat[hazard!="no hazard" & value>0, .(tot = sum(value)), by = y_axis][
+    order(-tot), y_axis]
+  }else{
+    y_order <- plot_dat[hazard!="no hazard" , .(tot = sum(value)), by = y_axis][
+      order(-tot), y_axis]
+  }
+  
+  if(!is.null(n_y.groups)){
+    y_order<-y_order[1:n_y.groups]
+    plot_dat<-plot_dat[y_axis %in% y_order]
+  }
+  
+  plot_dat[ , y_axis := factor(y_axis, levels = rev(y_order))]
+  plot_dat[ , hazardf := factor(hazard, levels = haz_levels)]
+  
+  result<-ggplot(plot_dat,
+                 aes(x = value,
+                     y = y_axis,
+                     fill = hazardf, 
+                     text = paste0("Y-group: ", y_axis, "<br>",
+                                   "Hazard: ", hazard, "<br>",
+                                   "Exposure: ", value))) +             
+    scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+    scale_fill_manual(values = cols_fill,
+                      breaks  = haz_levels,     # keep the legend in that order
+                      drop    = FALSE) +  
+    labs(x = exp_lab,
+         y = NULL,
+         title = plot_title,
+         fill = "Hazard") +                 # legend title
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.major.y = element_blank())
+  
+  if(is_compound==T){
+    result<-result+geom_bar(stat="identity",colour="grey20",linewidth=0.2)
+  }else{
+    result<-result+geom_col(position = position_dodge(width = 0.9),colour="grey20",linewidth=0.2) 
+  }
+  
+  if(plotly){
+    result<-ggplotly(result,tooltip = "text")
+  }
+  return(result)
+  
+  }
+```
+
+**Q3** plotting function
+```{r q3 plot fun}
+#| echo: true
+
+plot3_fun<-function(plot_dat,
+                      scenario_cols,
+                      facet_var,
+                      stack_var,
+                      stack_var_order,
+                      plot_title=NULL,
+                      yaxis_lab,
+                      n_grps,
+                      plotly=F){
+  
+    all_cols<-c(scenario_cols,facet_var,stack_var)
+  
+    plot_dat<-plot_dat[,all_cols,with=F]
+    
+  setnames(plot_dat,c(scenario_cols,facet_var,stack_var),c(names(scenario_cols),"facet_var","group"))
+
+  group_sel <- plot_dat[group!="no hazard", .(tot = sum(scenario2)), by = group][
+      order(-tot), group][1:n_grps]
+  
+  plot_dat[!group %in% group_sel,group:="other"]
+  
+  plot_dat<-plot_dat[,.(scenario1=sum(scenario1,na.rm=T),
+             scenario2=sum(scenario2,na.rm =T),
+             diff=sum(diff,na.rm=T)),by=.(facet_var,group)]
+
+  plot_dat<-melt(plot_dat,id.vars = c("facet_var","group"),variable.name = "scenario")  
+  diff_tot<-plot_dat[scenario == "diff",
+               .(value = sum(value, na.rm = TRUE)),
+               by = facet_var
+               ][, `:=`(scenario = "Δ",          
+                        group = "Δ")]
+  plot_dat<-plot_dat[scenario!="diff"]
+  
+  plot_dat<-rbindlist(list(plot_dat,diff_tot),use.names = T,fill=T)
+
+  # give each bar its own x-position:
+  plot_dat[ , facet_var := factor(facet_var, levels = stack_var_order)]
+  
+  grp_levels <- setdiff(unique(plot_dat$group), "Δ")
+  n_grp     <- length(grp_levels)
+  base_cols <- pal_brewer(palette="Set3")(n_grp)
+  grp_pal  <- setNames(base_cols[seq_len(n_grp)], grp_levels)
+  pal_comb  <- c(grp_pal, `Δ` = "grey20")
+  
+  plot_dat[,slab:=scenario
+           ][scenario=="scenario1",slab:="S1"
+             ][scenario=="scenario2",slab:="S2"
+               ][,slab:=factor(slab,levels=c("S1","S2","Δ"))]
+  
+  nice_num <- function(x, acc = 0.1) {
+    lab <- label_number(scale_cut = cut_short_scale(), accuracy = acc)
+    sign <- ifelse(x < 0, "−", "")           # U+2212 for a true minus sign
+    out  <- lab(abs(x))                      # format the magnitude
+    paste0(sign, out)
+  }
+  plot_dat[, tooltip := sprintf(
+    "Hazard: %s<br>Scenario: %s<br>Crop: %s<br>Value: %s",
+    facet_var, slab, group,nice_num(value)
+  ),by=.I]
+  
+  g<-ggplot(plot_dat,
+         aes(x = slab,
+             y = value, 
+             fill = group,
+             text = tooltip)) +
+    geom_col(position = "stack",colour="grey20",size=0.2,width=1) +          # stacked bars
+    scale_x_discrete(expand = c(0, 0)) +               # no left/right padding
+    facet_grid(~ facet_var,
+               labeller = labeller(                    # <- new
+                 facet_var = label_wrap_gen(8)
+               )) +  # 1 row of facets
+    scale_fill_manual(values = pal_comb, name = NULL) +
+    scale_y_continuous(                                   # optional: short scale
+      labels = label_number(scale_cut = cut_short_scale())) +
+    labs(x = NULL, y = yaxis_lab, fill = stack_var,title=plot_title) +
+    theme_minimal() +
+    theme(
+      strip.text.x = element_text(size = 9, face = "bold"),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank()
+    )
+  
+  if(plotly){
+    g<-ggplotly(g,tooltip = "text")
+  }
+  return(g)
+  
+  }
+```
+
+### Notebook `wireframe`
+
+#### Overview
+
+This notebook supports strategic decision-making for climate adaptation planning. It enables users to identify which crops and livestock are most exposed to climate hazards under various future scenarios. The tool is designed for grant applicants, program officers, and regional planners to prioritize investments and justify interventions based on risk exposure.
+
+`Add note on performance to manage user expectations?`
+
+#### Notebook Controls & Essentials
+
+Description of controls and what they enable you to do:
+- Compound vs non-compound hazards  
+- Relative vs absolute comparisons  
+- Side-by-side vs difference  
+- Annual (all crops and livestock) vs GCCMI crop calendar (annual crops only?)  
+- Scenarios: SSPs x Future Timeframe  
+- Exposure variable (VoP IntD, Vop USD, Harvested Area)  
+- Hazards (Fixed vs Variable)  
+- Severity (Moderate, Severe, Extreme)  
+- Commodities  
+- Geographic selectors  
+
+#### Methods & Data Sources
+ 
+This analysis estimates the exposure of crops and livestock to climate hazards using value of production (VoP) as an economic risk indicator. Production data is sourced from MapSPAM `Add version` for crops adjusted with FAOstat international prices (2015 International or US Dollars). Livestock VoP comes from Herrero et al. (2013) and is adjusted to `year` using `GLW4`.
+
+Hazard risks are calculated using climate datasets (CHIRPS, AgERA5, CMIP6 projections) and aligned with agricultural seasons via the GGCMI Phase 3 crop calendar. The probability of hazards occurrence is estimated across years, with compound hazards identified where multiple risks (e.g., dry, heat, wet) coincide. `Add link to methods section for selected hazards`.
+
+The integration of hazard risk with VoP data quantifies the economic value of production exposed, providing insights for adaptation planning. Full details on hazard definitions, include hazard classification thresholds and methodology can be found in the full Methods Section.
+
+**Note on Static Exposure Data**
+
+The exposure data presented provides a static representation of agricultural land use and crop distribution. While this means it does not account for real-time changes in farming practices—such as shifts in crop selection or adaptive strategies in response to seasonal variability—it still offers valuable insights. By analyzing historical exposure patterns, we can identify regions and commodities that have consistently faced high climate risks, helping to inform long-term planning and investment decisions.
+
+Despite its limitations, this dataset remains a powerful tool for understanding broad trends in hazard exposure. It provides a foundation for identifying where adaptation strategies may be most needed and serves as a starting point for deeper analyses incorporating additional, dynamic data sources in the future.
+ 
+`Dev Note`: Side by side plots need to fix the continuous axis to be the same scale for both plots
+ 
+#### Q1 Total Exposure (upset plot)
+
+`Dev Note`: At the moment the “shared-controls” approach (i.e., trying to render one reactive plot controls in several places) is still brittle inside a single-file Quarto + Shiny document. When we mount the same control more than once we wind up creating duplicated input bindings without a proper ShinySession context resolution.
+
+**Selected Hazards**
+`Add reactive details for the selected hazards, given the severity and hazard method selected and the calculation window`
+
+:::: {style="display: flex;"}
+::: {}
+```{r}
+#| label:  relative
+#| echo: false
+checkboxInput(
+  inputId = "relative",
+  label = "Show % (relative values)",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label:  difference
+#| echo: false
+checkboxInput(
+  inputId = "difference",
+  label = "Show differences",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+::::
+
+
+The plot shows the exposure of all the commodities you have selected together (if you want to compare between crops please see the following sections).
+
+`Dev Note`: Alignment of horizontal bars needs work, factors get dropped if no hazard, scales differ. Fix variable y-axis scale.
+
+```{r q1 create plots}
+#| echo: false
+q1_plot<-reactive({
+  q1_dat<-haz_merge()[admin0_name=="all" & crop=="all" & hazard %in% compound_set_full]
+
+  if(input$difference==F){
+    up_s1<-q1_fun(data=copy(q1_dat),
+                   val_col = plot_inputs()$val_col1,
+                   exp_lab = plot_inputs()$unit_name,
+                   plot_title = plot_inputs()$s1_lab) 
+      
+      up_s2<-q1_fun(data=q1_dat,
+                     val_col =  plot_inputs()$val_col2,
+                     exp_lab = plot_inputs()$unit_name,
+                     plot_title = plot_inputs()$s2_lab)
+      
+      q1_plot <- patchwork::wrap_plots(
+        up_s1,
+        up_s2,
+        ncol = 2,          # 2 side-by-side
+        nrow = 1
+      )
+    }
+    
+    if(input$difference==T){
+      q1_plot<-q1_fun(data=copy(q1_dat),
+                     val_col =  plot_inputs()$val_col1,
+                     exp_lab=  plot_inputs()$unit_name,
+                     plot_title= plot_inputs()$diff_lab) 
+    }
+  
+  q1_plot
+
+})
+```
+
+```{r q1 render}
+#| echo: false
+renderPlot({
+  q1_plot()
+  })
+```
+
+**Dynamic Insight**
+
+For the selected commodities total exposure for **`r reactive({input$scenario1})`** is `insert value` of `insert total value` `r reactive({input$unit})` or `insert value` %. The exposure to compound (more than one) hazards is `insert value` `r reactive({input$unit})` or `insert value` %. 
+
+Total exposure for **`r reactive({input$scenario2})`** is `insert value` of `insert total value` `r reactive({input$unit})` or `insert value` %. The exposure to compound (more than one) hazards is `insert value` `r reactive({input$unit})` or `insert value` %. 
+
+Comparing **`r reactive({input$scenario1})`** to **`r reactive({input$scenario2})`** total exposure `increase/decreases` by `insert value` `r reactive({input$unit})` or `insert value` % . Exposure to compound hazards `increase/decreases` by `insert value` `r reactive({input$unit})` or `insert value` `r reactive({input$unit})` %.  
+
+
+#### Q2 Which crops are most exposed?  
+
+This section focuses on crops. These plots help you explore which commodities are most exposed to climate hazards, either:  
+- Individually (e.g. just heat) — when `Show compound hazards` is unselected, or 
+- In combination (e.g. heat + dry + wet) — when `Show compound hazards` is selected.
+
+You can switch between:  
+- Absolute values (Show % not selected) – these show the total exposure in real terms (e.g. USD), useful to understand the economic impact.  
+- Relative values (Show % selected) – these show exposure as a percentage of total production per crop, helping you identify crops that are most vulnerable proportionally (even if they aren’t economically dominant).  
+
+Use absolute plots to prioritize which crops matter most economically.  
+Use relative plots to spot hidden vulnerabilities in less valuable but highly exposed crops.  
+
+:::: {style="display: flex;"}
+::: {}
+```{r}
+#| label:  relative2
+#| echo: false
+checkboxInput(
+  inputId = "relative",
+  label = "Show % (relative values)",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label:  difference2
+#| echo: false
+checkboxInput(
+  inputId = "difference",
+  label = "Show differences",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label:  compound2
+#| echo: false
+checkboxInput(
+  inputId = "compound",
+  label = "Show compound hazards",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label:  simplify-compound2
+#| echo: false
+checkboxInput(
+  inputId = "simplify_compound",
+  label = "Simplify compound hazards",
+  value = FALSE,  # default state,
+  width =Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label: n2
+#| echo: false
+renderUI({
+  numericInput(
+    inputId = "n2",
+    label   = "No. commodities Q2",     # control caption
+    value   = length(commodities()),    # default = # selected commods
+    min     = 1,
+    max     = length(commodities()),    # slider capped at that #
+    step    = 1,
+    width   = Section1.Input.Width      # your existing width helper
+  )
+})
+```
+:::
+::::
+
+`Dev Note: Plot height needs to scale with n-crops selected`. 
+
+```{r}
+#| label: q2-create-plots
+#| echo: false
+#| 
+q2_plot<-reactive({
+  q2_dat<-haz_merge()[admin0_name=="all" & crop!="all" & hazard %in% plot_inputs()$haz_set]
+  if(input$difference==F){
+    
+    q2_s1<-q2_fun(plot_dat=copy(q2_dat),
+                  exp_lab = plot_inputs()$unit_name,
+                  n_y.groups=input$n2,
+                  val_col=plot_inputs()$val_col1,
+                  haz_levels = plot_inputs()$haz_set,
+                  cols_fill = plot_inputs()$haz_pal,
+                  is_compound = input$compound,
+                  plot_title=plot_inputs()$s1_lab)
+    
+    q2_s2<-q2_fun(plot_dat=copy(q2_dat),
+                  exp_lab = plot_inputs()$unit_name,
+                  n_y.groups=input$n2,
+                  val_col=plot_inputs()$val_col2,
+                  haz_levels = plot_inputs()$haz_set,
+                  cols_fill = plot_inputs()$haz_pal,
+                  is_compound = input$compound,
+                  plot_title=plot_inputs()$s2_lab)
+    
+    for (i in seq_along(q2_s1$x$data)) {
+      q2_s1$x$data[[i]]$showlegend <- FALSE
+    }
+    
+    # Strip internal titles
+    q2_s1$x$layout$title <- NULL
+    q2_s2$x$layout$title <- NULL
+    
+    q2_plot <- subplot(q2_s1, q2_s2, nrows = 1, shareX = FALSE, shareY = TRUE, titleX = T, titleY = F) %>%
+      layout(
+        annotations = list(
+          list(
+            text = plot_inputs()$s1_lab,  # Title for q2_s1
+            x = 0.22, y = 1.05, xref = "paper", yref = "paper",
+            showarrow = FALSE, font = list(size = 14)
+          ),
+          list(
+            text = plot_inputs()$s2_lab,  # Title for q2_s2
+            x = 0.78, y = 1.05, xref = "paper", yref = "paper",
+            showarrow = FALSE, font = list(size = 14)
+          )
+        ),
+        margin = list(t = 80)
+      )    
+  }
+  
+  if(input$difference==T){
+    q2_plot<-q2_fun(plot_dat=copy(q2_dat),
+                  exp_lab = plot_inputs()$unit_name,
+                  n_y.groups=input$n2,
+                  val_col=plot_inputs()$val_col1,
+                  haz_levels = plot_inputs()$haz_set,
+                  cols_fill = plot_inputs()$haz_pal,
+                  is_compound = input$compound,
+                  plot_title=plot_inputs()$diff_lab)
+  }
+  
+  q2_plot
+})
+```
+
+```{r q2 render plot}  
+#| echo: false
+  renderPlotly({
+    q2_plot()
+    })
+```
+
+**Dynamic Insights**
+
+Of your `insert value` selected commodities the most exposed commodities (in absolute terms) to `r reactive({input$severity})` hazards are:
+
+**`r reactive({input$scenario1})`**
+
+We need to generate a table like this:
+
+| Commodity | Unit | %  | Top Alone | Top Compound |
+|-----------|------|----|-----------|--------------|
+| Crop 1    | [n]  | [n] | Heat 10% | Heat+Dry 7%  |
+| Crop 2    | [n]  | [n] | Heat 40% | Heat Only 28%|
+| Crop 3    | [n]  | [n] | Dry 30%  | Dry Only 20% |
+| Crop 4    | [n]  | [n] | Dry 15%  | Heat+Dry 11% |
+| Crop 5    | [n]  | [n] | Dry 9%   | Dry Only 9%  |
+
+**`r reactive({input$scenario2})`**
+
+`Table as above`
+
+These crops show the greatest absolute changes in `r reactive({input$severity})` exposure  between `r reactive({input$scenario1})` and `r reactive({input$scenario2})`.
+
+`We need to generate a table like this:`
+
+| Commodity | Δ Unit | Δ % | Top Δ Alone | Top Δ Compound |
+|-----------|--------|-----|-------------|----------------|
+| Crop 1    | [n]    | [n] | Heat 10%    | Heat + Dry 7%  |
+| Crop 2    | [n]    | [n] | Heat 40%    | Heat Only 28%  |
+| Crop 3    | [n]    | [n] | Dry 30%     | Dry Only 20%   |
+| Crop 4    | [n]    | [n] | Dry 15%     | Heat + Dry 11% |
+| Crop 5    | [n]    | [n] | Dry 9%      | Dry Only 9%    |
+
+#### Q3 Which hazards pose the greatest threst to commodities?
+
+This section focuses on hazards.  
+
+Using stacked bars it overlays the n most important commodities (by value or area), the remaining commodities are combined into an "Other" category onto hazard exposure.  
+
+We can see the how distribution of crop exposure changes between hazards and scenarios. We might find that different crops dominate exposure to heat hazards compared to dry hazards.
+
+:::: {style="display: flex;"}
+::: {}
+```{r}
+#| label:  relative3
+#| echo: false
+checkboxInput(
+  inputId = "relative",
+  label = "Show % (relative values)",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label:  compound3
+#| echo: false
+checkboxInput(
+  inputId = "compound",
+  label = "Show compound hazards",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label:  simplify-compound3
+#| echo: false
+checkboxInput(
+  inputId = "simplify_compound",
+  label = "Simplify compound hazards",
+  value = FALSE,  # default state,
+  width =Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label: n-q3
+#| echo: false
+renderUI({
+  numericInput(
+    inputId="n3",
+    label="No. commodities Q3",
+    value = 8,
+    min = 1,
+    max = length(input$crops),
+    step = 1,
+    width = Section1.Input.Width
+  )
+})
+```
+:::
+::::
+
+```{r q3 create plots}
+#| echo: false
+
+q3_plot<-reactive({
+  plot3_fun(plot_dat=haz_merge()[hazard %in% plot_inputs()$haz_set & admin0_name=="all" & crop!="all"],
+              scenario_cols=plot_inputs()$scenario_cols,
+              facet_var="hazard",
+              stack_var="crop",
+              stack_var_order = plot_inputs()$haz_set,
+              plot_title=NULL,
+              yaxis_lab=plot_inputs()$unit_name,
+              n_grps=input$n3,
+              plotly=T)
+})
+```
+
+```{r q3 render plot}  
+#| echo: false
+  renderPlotly({
+    q3_plot()
+    })
+```
+
+**Dynamic Insight**
+
+`To add`
+
+#### Q4 Which geographies are  most exposed to hazards?
+
+:::: {style="display: flex;"}
+::: {}
+```{r}
+#| label:  relative4
+#| echo: false
+checkboxInput(
+  inputId = "relative",
+  label = "Show % (relative values)",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label:  difference4
+#| echo: false
+checkboxInput(
+  inputId = "difference",
+  label = "Show differences",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label:  compound4
+#| echo: false
+checkboxInput(
+  inputId = "compound",
+  label = "Show compound hazards",
+  value = FALSE,
+  width = Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label:  simplify-compound4
+#| echo: false
+checkboxInput(
+  inputId = "simplify_compound",
+  label = "Simplify compound hazards",
+  value = FALSE,  # default state,
+  width =Section1.Input.Width_half
+)
+```
+:::
+:::{}
+```{r}
+#| label: n-q4
+#| echo: false
+renderUI({
+  numericInput(
+    inputId="n4",
+    label="No. geographies Q4",
+    value = if(!is.null(admin2())){
+      length(admin2())
+      }else{
+        if(!is.null(admin1())){
+          length(admin1())
+          }else{
+            length(input$admin0)
+            }
+          },
+    min = 1,
+    max = if(!is.null(admin2())){
+      length(admin2())
+      }else{
+        if(!is.null(admin1())){
+          length(admin1())
+          }else{
+            length(input$admin0)
+            }
+          },
+    step = 1,
+    width = Section1.Input.Width
+  )
+})
+```
+:::
+::::   
+
+**`Developer to add map of total exposure by geography`**
+
+```{r q4 create plots}
+#| echo: false
+ q4_plot<-reactive({
+    q4_dat<-haz_merge()[admin0_name!="all" & crop=="all" & hazard %in% plot_inputs()$haz_set]
+    
+    if(input$difference==F){
+      q4_s1<-q2_fun(plot_dat=copy(q4_dat),
+                    exp_lab = plot_inputs()$unit_name,
+                    n_y.groups=input$n4,
+                    val_col=plot_inputs()$val_col1,
+                    haz_levels = plot_inputs()$haz_set,
+                    cols_fill =plot_inputs()$haz_pal,
+                    y_axis = plot_inputs()$q4_yaxis,
+                    is_compound = input$compound,
+                    plot_title=plot_inputs()$s1_lab)
+      
+      q4_s2<-q2_fun(plot_dat=copy(q4_dat),
+                    exp_lab = plot_inputs()$unit_name,
+                    n_y.groups=input$n4,
+                    val_col=plot_inputs()$val_col2,
+                    haz_levels = plot_inputs()$haz_set,
+                    cols_fill = plot_inputs()$haz_pal,
+                    y_axis = plot_inputs()$q4_yaxis,
+                    is_compound = input$compound,
+                    plot_title=plot_inputs()$s2_lab)
+      
+      for (i in seq_along(q4_s1$x$data)) {
+        q4_s1$x$data[[i]]$showlegend <- FALSE
+      }
+      
+      # Strip internal titles
+      q4_s1$x$layout$title <- NULL
+      q4_s2$x$layout$title <- NULL
+      
+      q4_plot <- subplot(q4_s1, q4_s2, nrows = 1, shareX = FALSE, shareY = TRUE, titleX = T, titleY = F) %>%
+        layout(
+          annotations = list(
+            list(
+              text = plot_inputs()$s1_lab,  # Title for q2_s1
+              x = 0.22, y = 1.05, xref = "paper", yref = "paper",
+              showarrow = FALSE, font = list(size = 14)
+            ),
+            list(
+              text = plot_inputs()$s2_lab,  # Title for q2_s2
+              x = 0.78, y = 1.05, xref = "paper", yref = "paper",
+              showarrow = FALSE, font = list(size = 14)
+            )
+          ),
+          margin = list(t = 80)
+        )    
+    }
+    
+    if(input$difference==T){
+      q4_plot<-q2_fun(plot_dat=copy(q4_dat),
+                      exp_lab = plot_inputs()$unit_name,
+                      n_y.groups=input$n4,
+                      val_col=plot_inputs()$val_col1,
+                      haz_levels = plot_inputs()$haz_set,
+                      cols_fill = plot_inputs()$haz_pal,
+                      y_axis = plot_inputs()$q4_yaxis,
+                      is_compound = input$compound,
+                      plot_title=plot_inputs()$diff_lab)
+    }
+    
+    
+    q4_plot
+ })
+```
+
+```{r q4 render plot}  
+#| echo: false
+  renderPlotly({
+    q4_plot()
+    })
+```
+  
+**Dynamic Insights**
+`To Add`
+  
+#### Q5 How does exposure differ between ssps, over time and between GCMs?
+
+Here we explore how total exposure varies between scenarios over time.
+
+```{r q5 prepare data}
+#| echo: false
+  haz_merge2<-reactive({
+    haz_merge2<-rbind(haz_s1_all(),haz_s2_all())
+    
+    haz_merge2<-haz_merge2[crop %in% commodities(),
+                           .(value=sum(value,na.rm=T),value_sd=sum(value_sd,na.rm=T)),
+                           by=.(severity,scenario,timeframe,hazard)]
+  
+  heat<-haz_merge2[grep("heat",hazard)]
+  heat[,hazard:="heat (any)"]
+  
+  wet<-haz_merge2[grep("wet",hazard)]
+  wet[,hazard:="wet (any)"]
+  
+  dry<-haz_merge2[grep("dry",hazard)]
+  dry[,hazard:="dry (any)"]
+  
+  # Sum values for the new categories
+  dhw<-rbind(dry,heat,wet)
+  
+  # Sum values for the new categories
+  num_cols<-c("value","value_sd")
+  dhw <- dhw[, lapply(.SD, sum, na.rm = TRUE), 
+             by = .(severity,scenario,timeframe,hazard), 
+             .SDcols = num_cols]
+  
+  # Bind to the main dataset
+  haz_merge2<-rbind(haz_merge2,dhw)
+  
+  # enforce sd being all NA if scenario is historic
+  haz_merge2[scenario=="historic",value_sd:=NA]
+  
+  # Calc 95% CIs
+  haz_merge2[,c("value_low","value_high"):=ci_95(value,value_sd,5),by=.I]
+
+  # Make timeframes numeric
+  haz_merge2[timeframe=="historic",year:=mean(c(2014,1995))-0.5
+             ][timeframe!="historic",year:=mean(as.numeric(unlist(strsplit(timeframe,"-"))))-0.5,by=timeframe]
+  
+  haz_merge2
+  })
+```
+
+```{r q5 create plot}
+#| echo: false
+q5_plot<-reactive({
+  dodge <- position_dodge(width = 0.6)    
+  
+  hline_dat <- haz_merge2()[hazard %in% solo_set & scenario == "historic",
+                          .(yintercept = value),  
+                          by = hazard]            # <- facet variable
+  
+  ggplot(haz_merge2()[hazard %in% solo_set],
+         aes(x = factor(year),                # discrete x for tidy spacing
+             y = value,
+             colour = scenario)) +            # colour distinguishes scenarios
+    geom_errorbar(
+      aes(ymin = value_low, ymax = value_high),
+      position  = dodge,
+      width     = 0,                        # clean vertical bar, no “cap”
+      linewidth = 0.4
+    ) +
+    geom_point(
+      position = dodge,
+      size     = 2.4
+    ) +
+    geom_hline(data = hline_dat,
+               aes(yintercept = yintercept),
+               colour = "grey40", linetype = "dashed") +
+    facet_grid(hazard ~ .,scales="free_y") +                  # ← vertical facets
+    scale_colour_brewer(palette = "Dark2", name = "Scenario") +
+    scale_y_continuous(                                   # optional: short scale
+      labels = label_number(scale_cut = cut_short_scale())) +
+    labs(
+      x = "Year",
+      y = "Value"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      axis.text.x        = element_text(angle = 45, hjust = 1),
+      strip.text.y       = element_text(face = "bold")  # facet labels
+    )
+})
+```
+
+```{r q5 render plot}
+#| echo: false
+  renderPlotly({
+    q5_plot()
+    })
+```
+  
+**Dynamic Insights**
+`To Add`
+
+#### Methods & Datasets - Expanded
+
+##### Datasets
+`To Add`
+
+##### Methods
+`To Add`
+
+
+### Vect map & COG tif plotting (to do)
+```{r}
+#| eval: false
+#| echo: true
+  s3_crop_tif_paths<-data.table(expand.grid(model=c("historic","ENSEMBLEmean","ENSEMBLEsd"),
+                                            severity=c("moderate","extreme","severe"),
+                                            variable=c("vop_intld15","vop_usd15"),
+                                            period=c("annual","jagermeyr"),
+                                            interaction=c("NDWS+NTx35+NDWL0","NDWS+THI-max+NDWL0"),
+                                            crop=crops))
+  
+  s3_crop_tif_paths[,file_path:=paste0("s3://digital-atlas/domain=hazard_exposure/source=atlas_cmip6/region=ssa/processing=hazard-risk-exposure/variable=",
+                                       variable,"/period=",period,"/model=",model,"/severity=",severity,"/interaction=",interaction,"/",crop,".tif")]
+  
+  user_selections_crop_tifs<-list(crop="maize",timeframe="2021-2040",scenario="ssp585",int_hazard="any")
+  
+  s3_crop_tif<-s3_crop_tif_paths[severity==user_selections$severity & 
+                                   variable==user_selections$variable & 
+                                   period==user_selections$period & 
+                                   interaction==user_selections$interaction &
+                                   crop == user_selections_crop_tifs$crop,file_path]
+  
+  # If we need relative values we will need to get total exposure for the selected crop
+  if(user_selections_crop_tifs$crop %in% crops){
+    tot_file<-paste0(
+      "s3://digital-atlas/domain=exposure/type=crop/source=spam2020v1r2_ssa/region=ssa/processing=analysis-ready/variable=", 
+      user_selections$variable,"/spam_",user_selections$variable,"_all.tif")
+    user_selection_crop_code<-ms_codes[Fullname==user_selections_crop_tifs$crop,Code]
+    r_tot<-rast(tot_file)[[user_selection_crop_code]]
+  }else{
+    tot_file<-paste0(
+      "s3://digital-atlas/domain=exposure/type=livestock/source=glw4/region=ssa/time=2015/processing=atlas-harmonized/variable=",
+      user_selections$variable,"/glw4_",user_selections$variable,".tif")
+    
+  }
+  
+  r_tot <- mask(crop(r_tot, aoi),geo_selection)
+  
+  
+  
+  # Connect to remote COG – this does NOT download the full file
+  r_fut <- rast(s3_crop_tif[grepl("ENSEMBLEmean",s3_crop_tif)])
+  r_fut<-r_fut[[grep(paste0(user_selections_crop_tifs$scenario,".*",user_selections_crop_tifs$timeframe),names(r_fut),value=T)]]
+  r_hist <- rast(s3_crop_tif[grepl("historic",s3_crop_tif)])
+  
+  names(r_hist)<-unlist(tstrsplit(names(r_hist),"_",keep=4))
+  names(r_fut)<-unlist(tstrsplit(names(r_fut),"_",keep=4))
+  
+  r_hist<-r_hist[[user_selections_crop_tifs$int_hazard]]
+  r_fut<-r_fut[[user_selections_crop_tifs$int_hazard]]
+  
+  r<-c(r_hist,r_fut)
+  names(r)<-paste(paste(user_selections_crop_tifs$int_hazard,"hazard: "),c("historical",paste(user_selections_crop_tifs$scenario,user_selections_crop_tifs$timeframe)))
+  
+  # Crop – this triggers a HTTP range request to fetch only needed tiles
+  r_crop <- mask(crop(r, aoi),geo_selection)
+  r_crop_diff<-r_crop[[2]] - r_crop[[1]]
+  # Plot cropped data
+  plot(r_crop)
+  plot(r_crop_diff)
+```
+  
+  
